@@ -1563,6 +1563,35 @@ mod tests {
         assert_eq!(no_decay, 1.0);
     }
 
+    /// The misbehavior `AppConfig::validate` exists to prevent: with a
+    /// negative lambda the decay factor *grows* with age, so the older of
+    /// two equally relevant files wins. Pinned here so the guard's purpose
+    /// stays visible even though no config can reach this state any more.
+    #[test]
+    fn negative_lambda_inverts_recency_ranking() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let mut s = BM25Store::open_in_memory_with(-0.01, 0.3, true).unwrap();
+        s.upsert(
+            "old.md",
+            now_ms - 100 * 86_400_000,
+            20,
+            "rust ownership rules",
+            None,
+        )
+        .unwrap();
+        s.upsert("new.md", now_ms, 20, "rust ownership rules", None)
+            .unwrap();
+
+        let hits = s.search("rust", 5, true).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "old.md");
+        assert_eq!(hits[1].path, "new.md");
+    }
+
     #[test]
     fn search_ranks_recent_higher() {
         // Two files with the same content but different mtimes.

@@ -424,7 +424,39 @@ impl AppConfig {
         };
 
         config.apply_env_overrides();
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Check the value ranges that TOML itself cannot express.
+    ///
+    /// `deny_unknown_fields` catches a misspelt key, but not a well-typed
+    /// value that is nonsense: `time_decay_lambda = -0.01` parses cleanly
+    /// and then makes `exp(-lambda * age_days)` *grow* with age, so the
+    /// oldest memory outranks the newest — the inversion of what
+    /// `search_ranks_recent_higher` pins. The env overrides already reject
+    /// these; this closes the config-file and programmatic paths, which
+    /// are the ones operators are actually told to use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the key and the offending value when
+    /// `time_decay_lambda` is not finite and `>= 0.0`, or when
+    /// `time_decay_alpha` is not finite and inside `0.0..=1.0`.
+    pub fn validate(&self) -> Result<()> {
+        let lambda = self.memory.index.time_decay_lambda;
+        if !lambda.is_finite() || lambda < 0.0 {
+            anyhow::bail!(
+                "[memory.index].time_decay_lambda must be a finite value >= 0.0, got {lambda}"
+            );
+        }
+        let alpha = self.memory.index.time_decay_alpha;
+        if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
+            anyhow::bail!(
+                "[memory.index].time_decay_alpha must be a finite value in 0.0..=1.0, got {alpha}"
+            );
+        }
+        Ok(())
     }
 
     fn default_config_path() -> PathBuf {
@@ -460,8 +492,10 @@ impl AppConfig {
         self.memory.index.enabled = env_bool("MEMORY_INDEX_ENABLED", self.memory.index.enabled);
         if let Ok(v) = std::env::var("MEMORY_INDEX_TIME_DECAY_LAMBDA") {
             match v.parse::<f64>() {
-                Ok(n) if n >= 0.0 => self.memory.index.time_decay_lambda = n,
-                Ok(_) => tracing::warn!("MEMORY_INDEX_TIME_DECAY_LAMBDA must be >= 0; ignoring"),
+                Ok(n) if n.is_finite() && n >= 0.0 => self.memory.index.time_decay_lambda = n,
+                Ok(_) => tracing::warn!(
+                    "MEMORY_INDEX_TIME_DECAY_LAMBDA must be a finite value >= 0; ignoring"
+                ),
                 Err(e) => {
                     tracing::warn!("MEMORY_INDEX_TIME_DECAY_LAMBDA={v:?} not a f64: {e}; ignoring")
                 }
@@ -626,6 +660,79 @@ mod tests {
     use super::*;
     use crate::embedding::EmbeddingConfig;
 
+    // Load `body` from a throwaway `memory.toml`. An explicit path keeps a
+    // developer's real `~/.anolisa/memory.toml` out of the test.
+    fn load_from_toml(dir: &Path, body: &str) -> Result<AppConfig> {
+        let path = dir.join("memory.toml");
+        std::fs::write(&path, body)?;
+        AppConfig::load(Some(&path))
+    }
+
+    #[test]
+    fn load_rejects_negative_decay_lambda_from_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = load_from_toml(dir.path(), "[memory.index]\ntime_decay_lambda = -0.01\n")
+            .expect_err("a negative lambda inverts recency ranking")
+            .to_string();
+        assert!(
+            err.contains("time_decay_lambda"),
+            "must name the key: {err}"
+        );
+        assert!(err.contains("-0.01"), "must show the value: {err}");
+    }
+
+    #[test]
+    fn load_rejects_alpha_above_one_from_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = load_from_toml(dir.path(), "[memory.index]\ntime_decay_alpha = 5.0\n")
+            .expect_err("alpha is a 0.0..=1.0 weight")
+            .to_string();
+        assert!(err.contains("time_decay_alpha"), "must name the key: {err}");
+    }
+
+    #[test]
+    fn load_rejects_nan_lambda() {
+        // TOML has a `nan` literal, and NaN poisons every comparison the
+        // ranker makes, so it has to be rejected rather than parsed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = load_from_toml(dir.path(), "[memory.index]\ntime_decay_lambda = nan\n")
+            .expect_err("NaN is not a usable decay rate")
+            .to_string();
+        assert!(
+            err.contains("time_decay_lambda"),
+            "must name the key: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_documented_ranges() {
+        // 0.0 lambda ("set to 0.0 to disable") and 1.0 alpha are the
+        // documented extremes; the guard must not reject them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = load_from_toml(
+            dir.path(),
+            "[memory.index]\ntime_decay_lambda = 0.0\ntime_decay_alpha = 1.0\n",
+        )
+        .expect("documented extremes are valid");
+        assert_eq!(cfg.memory.index.time_decay_lambda, 0.0);
+        assert_eq!(cfg.memory.index.time_decay_alpha, 1.0);
+    }
+
+    #[test]
+    fn validate_rejects_programmatic_config() {
+        // A config built in code never passes through load(), so the guard
+        // has to stand on its own for MemoryService::new to call it.
+        assert!(AppConfig::default().validate().is_ok());
+
+        let mut cfg = AppConfig::default();
+        cfg.memory.index.time_decay_lambda = -1.0;
+        let err = cfg.validate().expect_err("negative lambda").to_string();
+        assert!(
+            err.contains("time_decay_lambda"),
+            "must name the key: {err}"
+        );
+    }
+
     #[test]
     fn embedding_config_default_is_none() {
         let cfg = AppConfig::default();
@@ -695,6 +802,7 @@ mod tests {
     fn shipped_default_toml_parses() {
         let toml_src = include_str!("../config/default.toml");
         let cfg: AppConfig = toml::from_str(toml_src).expect("shipped default.toml must parse");
+        cfg.validate().expect("shipped default.toml must validate");
         assert!(cfg.memory.consolidation.enabled);
         assert!(cfg.memory.consolidation.max_facts > 0);
     }

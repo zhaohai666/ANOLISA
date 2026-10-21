@@ -50,7 +50,19 @@ impl MemoryService {
     /// Always ensures the mount; starts a Session Log if the configured base
     /// directory is writable. Failure to start the session is logged and
     /// degrades gracefully (mem_promote / mem_session_log will return errors).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::InvalidArgument`] when `config` carries an
+    /// out-of-range value that [`AppConfig::validate`] rejects. Callers that
+    /// build the config programmatically skip `AppConfig::load`, so the check
+    /// runs again here — before `pick_strategy` unshares a user namespace,
+    /// which cannot be undone on the way out.
     pub fn new(config: AppConfig) -> Result<Self> {
+        config
+            .validate()
+            .map_err(|e| MemoryError::InvalidArgument(e.to_string()))?;
+
         // `pick_strategy` below may unshare into a user namespace, after
         // which `geteuid()` reports the mapped uid (0 for the default
         // `0 <host uid> 1` mapping) instead of the one we were launched
