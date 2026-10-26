@@ -79,10 +79,32 @@ pub(crate) fn validate_snapshot_id(id: &str) -> Result<()> {
 pub fn create_tarball(mount: &MountPoint, id: &str, name: &str) -> Result<SnapshotInfo> {
     validate_snapshot_id(id)?;
     let dir = snapshots_dir(mount);
-    std::fs::create_dir_all(&dir)?;
+    let tmp_path = dir.join(format!("{id}.tar.gz.partial"));
+    match create_tarball_inner(mount, id, name, &dir, &tmp_path) {
+        Ok(info) => Ok(info),
+        Err(e) => {
+            // The tarball is streamed into a `.partial` file that is only
+            // renamed into place at the very end. Every early-error path —
+            // a symlink discovered mid-walk, a tar append failure — used to
+            // leave that partial file behind, so repeated failing snapshots
+            // leaked an ever-growing file into the meta area. Clean it up
+            // on the way out.
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+fn create_tarball_inner(
+    mount: &MountPoint,
+    id: &str,
+    name: &str,
+    dir: &Path,
+    tmp_path: &Path,
+) -> Result<SnapshotInfo> {
+    std::fs::create_dir_all(dir)?;
 
     let archive_path = dir.join(format!("{id}.tar.gz"));
-    let tmp_path = dir.join(format!("{id}.tar.gz.partial"));
 
     // 1. Stream mount tree → tmp tarball, skipping .anolisa/.
     {
@@ -411,5 +433,38 @@ mod tests {
         assert!(validate_snapshot_id("/abs").is_err());
         // 128-byte limit is enforced.
         assert!(validate_snapshot_id(&"a".repeat(129)).is_err());
+    }
+
+    fn setup() -> (tempfile::TempDir, MountPoint) {
+        let tmp = tempdir().unwrap();
+        let mp =
+            crate::ns::MountPoint::ensure(crate::ns::Namespace::user("alice").unwrap(), tmp.path())
+                .unwrap();
+        (tmp, mp)
+    }
+
+    /// A snapshot attempt that fails mid-stream (a symlink discovered in the
+    /// mount tree) must not leave the `.tar.gz.partial` scratch file behind:
+    /// every retry would otherwise leak another growing file into the meta
+    /// area until a successful snapshot or manual cleanup.
+    #[test]
+    fn create_tarball_removes_the_partial_file_on_failure() {
+        let (_tmp, mount) = setup();
+        let notes = mount.root.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("a.md"), "hello").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", notes.join("leak")).unwrap();
+
+        let err = create_tarball(&mount, "snap_test_leak", "leaky").unwrap_err();
+        assert!(matches!(err, MemoryError::PathOutsideMount(_)), "{err:?}");
+
+        let partial = mount
+            .meta_dir
+            .join("snapshots")
+            .join("snap_test_leak.tar.gz.partial");
+        assert!(
+            !partial.exists(),
+            "a failed snapshot must not leave a .partial file"
+        );
     }
 }
