@@ -134,23 +134,37 @@ pub fn normalize_relative_dates(content: &str) -> String {
         result = replace_date(&result, cn_day, today + Duration::days(*days));
     }
 
-    // "N days ago" / "N 天前"
+    // "N days ago" / "N 天前". The count is model-controlled free text, so
+    // it must never reach panicking chrono math: `Duration::days` panics
+    // beyond ~1.07e14 days and `NaiveDate - Duration` panics once the result
+    // leaves the ±262143-year representable range ("99999999999 days ago"
+    // already trips the latter). Fall back to the original text when the
+    // offset is not representable — absurd input is junk, not a crash.
     result = DAYS_AGO_EN
         .replace_all(&result, |caps: &regex::Captures| {
-            let n: i64 = caps[1].parse().unwrap_or(0);
-            let date = today - Duration::days(n);
-            date.format("%Y-%m-%d").to_string()
+            subtract_days_or_keep(today, caps)
         })
         .to_string();
     result = DAYS_AGO_CN
         .replace_all(&result, |caps: &regex::Captures| {
-            let n: i64 = caps[1].parse().unwrap_or(0);
-            let date = today - Duration::days(n);
-            date.format("%Y-%m-%d").to_string()
+            subtract_days_or_keep(today, caps)
         })
         .to_string();
 
     result
+}
+
+/// Subtract `N` days from `today` for the "N days ago" rewrites, returning
+/// `None` when the count is unparseable or the offset is not representable —
+/// the caller then keeps the original text instead of panicking.
+fn subtract_days_or_keep(today: NaiveDate, caps: &regex::Captures) -> String {
+    let Ok(n) = caps[1].parse::<i64>() else {
+        return caps[0].to_string();
+    };
+    match Duration::try_days(n).and_then(|d| today.checked_sub_signed(d)) {
+        Some(date) => date.format("%Y-%m-%d").to_string(),
+        None => caps[0].to_string(),
+    }
 }
 
 /// Replace a relative date expression with an absolute date.
@@ -261,6 +275,34 @@ mod tests {
         let result = normalize_relative_dates("Meeting today about auth");
         assert!(!result.contains("today"));
         assert!(result.contains(&Local::now().date_naive().format("%Y-%m-%d").to_string()));
+    }
+
+    /// The "N days ago" count is model-controlled free text: a huge count
+    /// must not reach panicking chrono math (`Duration::days` out of bounds
+    /// / NaiveDate subtraction outside the ±262143-year range) — junk input
+    /// keeps its original text instead of crashing the consolidation pass.
+    #[test]
+    fn normalize_keeps_absurd_day_counts_instead_of_panicking() {
+        for junk in [
+            "99999999999999 days ago",  // beyond NaiveDate's range
+            "106751991167301 days ago", // beyond Duration::days' bounds
+            "99999999999999 天前",
+        ] {
+            let result = normalize_relative_dates(&format!("done {junk}"));
+            assert!(
+                result.contains(junk),
+                "unrepresentable {junk:?} must be kept verbatim, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_days_ago() {
+        let result = normalize_relative_dates("shipped 3 days ago");
+        let expected = (Local::now().date_naive() - Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(result.contains(&expected), "{result}");
     }
 
     #[test]
